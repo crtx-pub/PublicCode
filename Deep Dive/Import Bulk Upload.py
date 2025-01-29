@@ -1,4 +1,11 @@
+#################################################################
 
+
+#  This script is unofficial and intended solely for educational purposes. 
+#  We assume no responsibility for any misuse of the script or any of its components.
+
+
+#################################################################
 import os
 import json
 import requests
