@@ -59,7 +59,7 @@ def test_http_collector(logs_body, date_obj, component):
     body = "\n".join(json.dumps(log) for log in logs_body)  # Joining log entries with newline
 
     res = requests.post(
-        url="https://api-xsiam-sedemo.xdr.us.paloaltonetworks.com/logs/v1/bulk_load",
+        url="{APIURL}",
         headers=headers,
         data=body
     )
