@@ -59,7 +59,7 @@ def test_http_collector(logs_body, date_obj, component):
     body = "\n".join(json.dumps(log) for log in logs_body)  # Joining log entries with newline
 
     res = requests.post(
-        url="{APIURL}",
+        url="{APIURL}", # insert the URL of the API you got from the data archive component.
         headers=headers,
         data=body
     )
