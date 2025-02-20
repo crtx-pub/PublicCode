@@ -1011,9 +1011,9 @@ def cleanup_resources(aws_access_key_id=None, aws_secret_access_key=None):
         print("\nNo resources recorded; nothing to clean up.")
         return
 
-    # 2) Check if we even have any AWS resources to delete
+    # 2) Check if we have any AWS resources
     aws_resources_present = any(
-        r.get("type") in ("dynamodb","redshift","redshift_cluster","s3","rds_instance")
+        r.get("type") in ("dynamodb", "redshift", "redshift_cluster", "s3", "rds_instance")
         for r in data["resources"]
     )
     print("\nResources to clean up:")
@@ -1032,16 +1032,14 @@ def cleanup_resources(aws_access_key_id=None, aws_secret_access_key=None):
 
     print("Cleaning up / Destroying resources created by this script...")
 
-    # We'll store indices or references to resources we have successfully deleted
-    # so we can remove them from data["resources"] afterwards.
-    resources_to_remove = []
+    resources_to_remove = []  # we'll remove these after successful deletion
 
     for idx, resource in enumerate(data["resources"]):
         rtype = resource.get("type", "")
 
-        # 3) Ask if the user wants to delete this resource
-        if rtype == "mysql":
-            name_for_display = f"MySQL table '{resource['table']}' in DB '{resource['db_name']}' on host '{resource['db_host']}'"
+        # 3) Create a display name for the resource
+        if rtype  == "rds_instance":
+            name_for_display = f"RDS instance '{resource['db_instance_id']}' (engine '{resource.get('engine', 'mysql')}')"
         elif rtype == "dynamodb":
             name_for_display = f"DynamoDB table '{resource['table_name']}' in region '{resource['region']}'"
         elif rtype == "redshift":
@@ -1050,145 +1048,21 @@ def cleanup_resources(aws_access_key_id=None, aws_secret_access_key=None):
             name_for_display = f"Redshift cluster '{resource['cluster_identifier']}'"
         elif rtype == "s3":
             name_for_display = f"S3 object '{resource['object_key']}' in bucket '{resource['bucket']}' (region '{resource['region']}')"
-        elif rtype == "rds_instance":
-            name_for_display = f"RDS instance '{resource['db_instance_id']}' (engine '{resource.get('engine','mysql')}')"
         else:
             name_for_display = f"Unknown resource type: {rtype}."
 
-        confirm = input(f"\nWould you like to delete this resource? {name_for_display} (yes/no) [yes]: ").strip().lower() or "yes"
-        if confirm not in ("yes","y"):
+        # 4) Ask user if they want to delete
+        confirm = input(
+            f"\nWould you like to delete this resource? {name_for_display} (yes/no) [yes]: ").strip().lower() or "yes"
+        if confirm not in ("yes", "y"):
             print(f"Skipping deletion of {name_for_display}.")
             continue
 
-        # 4) Perform the actual deletion logic
-        deleted_successfully = False  # track if the deletion was successful
+        deleted_successfully = False
 
-        if rtype == "mysql":
-            print(f"\nDeleting {name_for_display} ...")
-            db_host = resource["db_host"]
-            db_name = resource["db_name"]
-            table = resource["table"]
-            db_user = input("Enter MySQL user [root]: ") or "root"
-            db_password = maskpass.askpass(prompt="Enter MySQL password (input hidden): ", mask='*')
-            try:
-                conn = mysql.connector.connect(host=db_host, user=db_user, password=db_password, database=db_name)
-                cursor = conn.cursor()
-                cursor.execute(f"DROP TABLE IF EXISTS {table}")
-                conn.commit()
-                print(f"Table '{table}' dropped.")
-                deleted_successfully = True
-            except mysql.connector.Error as err:
-                print(f"MySQL table drop error: {err}")
-            finally:
-                if 'cursor' in locals():
-                    cursor.close()
-                if 'conn' in locals() and conn.is_connected():
-                    conn.close()
-
-        elif rtype == "dynamodb":
-            import boto3
-            region = resource["region"]
-            session = boto3.Session(
-                aws_access_key_id=aws_access_key_id,
-                aws_secret_access_key=aws_secret_access_key,
-                region_name=region
-            )
-            ddb_client = session.client('dynamodb')
-            table_name = resource["table_name"]
-            print(f"\nDeleting DynamoDB table '{table_name}' in region '{region}'...")
-            try:
-                ddb_client.delete_table(TableName=table_name)
-                waiter = ddb_client.get_waiter('table_not_exists')
-                waiter.wait(TableName=table_name)
-                print(f"Table '{table_name}' deleted.")
-                deleted_successfully = True
-            except ClientError as e:
-                print(f"Error deleting DynamoDB table '{table_name}': {e}")
-
-        elif rtype == "redshift":
-            # older "redshift" type logic, if any
-            print(f"\nDeleting {name_for_display} ...")
-            user = input("Enter Redshift user: ").strip()
-            password = maskpass.askpass(prompt="Enter Redshift password (input hidden): ", mask='*')
-            import psycopg2
-            try:
-                conn = psycopg2.connect(
-                    dbname=resource["database"],
-                    user=user,
-                    password=password,
-                    host=resource["host"],
-                    port=resource["port"]
-                )
-                cursor = conn.cursor()
-                cursor.execute(f"DROP TABLE IF EXISTS {resource['table']}")
-                conn.commit()
-                print(f"Redshift table '{resource['table']}' dropped.")
-                deleted_successfully = True
-            except Exception as e:
-                print(f"Could not drop Redshift table '{resource['table']}': {e}")
-            finally:
-                if 'cursor' in locals():
-                    cursor.close()
-                if 'conn' in locals():
-                    conn.close()
-
-        elif rtype == "redshift_cluster":
-            print(f"\nDeleting {name_for_display} ...")
-            import psycopg2
-
-            user = resource["master_username"]
-            host = resource["host"]
-            port = resource["port"]
-            db_name = resource["database"]
-            schema = resource["schema"]
-            table = resource["table"]
-            if "master_password" in resource and resource["master_password"]:
-                password = resource["master_password"]
-                print("Using stored master password from resources file.")
-            else:
-                password = maskpass.askpass(
-                    prompt=f"Enter master password for Redshift cluster '{resource['cluster_identifier']}' (input hidden): ",
-                    mask='*'
-                )
-
-            # Drop table & schema
-            try:
-                conn = psycopg2.connect(dbname=db_name, user=user, password=password, host=host, port=port)
-                cursor = conn.cursor()
-                cursor.execute(f"DROP TABLE IF EXISTS {schema}.{table}")
-                cursor.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
-                conn.commit()
-                print(f"Dropped table '{schema}.{table}' and schema '{schema}'.")
-            except Exception as e:
-                print(f"Could not drop Redshift table/schema: {e}")
-            finally:
-                if 'cursor' in locals():
-                    cursor.close()
-                if 'conn' in locals():
-                    conn.close()
-
-            # Then delete the cluster
-            region = resource.get("region", "us-east-1")
-            redshift_client = boto3.client(
-                "redshift",
-                region_name=region,
-                aws_access_key_id=aws_access_key_id,
-                aws_secret_access_key=aws_secret_access_key
-            )
-            try:
-                print(f"Deleting cluster '{resource['cluster_identifier']}' (this may take a few minutes)...")
-                redshift_client.delete_cluster(
-                    ClusterIdentifier=resource["cluster_identifier"],
-                    SkipFinalClusterSnapshot=True
-                )
-                waiter = redshift_client.get_waiter("cluster_deleted")
-                waiter.wait(ClusterIdentifier=resource["cluster_identifier"])
-                print(f"Cluster '{resource['cluster_identifier']}' has been deleted.")
-                deleted_successfully = True
-            except Exception as e:
-                print(f"Could not delete Redshift cluster '{resource['cluster_identifier']}': {e}")
-
-        elif rtype == "s3":
+        # 5) Perform deletion
+        if rtype == "s3":
+            # Deleting both object and bucket
             print(f"\nDeleting {name_for_display} ...")
             region = resource["region"]
             s3_session = boto3.Session(
@@ -1197,113 +1071,399 @@ def cleanup_resources(aws_access_key_id=None, aws_secret_access_key=None):
                 region_name=region
             )
             s3_client = s3_session.client('s3')
+            bucket_name = resource["bucket"]
+            object_key = resource["object_key"]
+
+            # 1) Delete the object
             try:
-                s3_client.delete_object(Bucket=resource["bucket"], Key=resource["object_key"])
-                print(f"S3 object '{resource['object_key']}' deleted.")
+                s3_client.delete_object(Bucket=bucket_name, Key=object_key)
+                print(f"S3 object '{object_key}' deleted.")
+            except ClientError as e:
+                print(f"Could not delete S3 object '{object_key}': {e}")
+                # If deleting the object fails, we won't try to delete the bucket
+                # or remove from resources
+                continue
+
+            # 2) Delete the bucket
+            try:
+                s3_client.delete_bucket(Bucket=bucket_name)
+                print(f"S3 bucket '{bucket_name}' deleted.")
                 deleted_successfully = True
             except ClientError as e:
-                print(f"Could not delete S3 object '{resource['object_key']}': {e}")
+                print(f"Could not delete S3 bucket '{bucket_name}': {e}")
+
+
+
+        elif rtype == "dynamodb":
+
+            # Example DynamoDB table deletion if the resource is logged as {"type":"dynamodb",...}
+
+            print(f"\nDeleting DynamoDB table '{resource.get('table_name')}' in region '{resource.get('region')}'...")
+
+            region = resource.get("region", "us-east-1")
+
+            aws_session = boto3.Session(
+
+                aws_access_key_id=aws_access_key_id,
+
+                aws_secret_access_key=aws_secret_access_key,
+
+                region_name=region
+
+            )
+
+            ddb_client = aws_session.client("dynamodb")
+
+            table_name = resource.get("table_name", "fake_data")
+
+            deleted_successfully = False
+
+            try:
+
+                ddb_client.delete_table(TableName=table_name)
+
+                waiter = ddb_client.get_waiter("table_not_exists")
+
+                waiter.wait(TableName=table_name)
+
+                print(f"Deleted DynamoDB table '{table_name}'.")
+
+                deleted_successfully = True
+
+            except ClientError as ce:
+
+                print(f"Error deleting DynamoDB table '{table_name}': {ce}")
+
+
+        elif rtype == "redshift":
+
+            # "type": "redshift" might indicate a single table on an existing cluster
+
+            print(
+                f"\nDeleting Redshift table '{resource.get('table')}' from DB '{resource.get('database')}' on host '{resource.get('host')}:{resource.get('port')}'...")
+
+            user = input("Enter Redshift user: ").strip()
+
+            password = maskpass.askpass(prompt="Enter Redshift password (hidden): ", mask='*')
+
+            deleted_successfully = False
+
+            try:
+
+                import psycopg2
+
+                conn = psycopg2.connect(
+
+                    dbname=resource["database"],
+
+                    user=user,
+
+                    password=password,
+
+                    host=resource["host"],
+
+                    port=resource["port"]
+
+                )
+
+                cursor = conn.cursor()
+
+                cursor.execute(f"DROP TABLE IF EXISTS {resource['table']}")
+
+                conn.commit()
+
+                cursor.close()
+
+                conn.close()
+
+                print(f"Dropped Redshift table '{resource['table']}'.")
+
+                deleted_successfully = True
+
+            except Exception as e:
+
+                print(f"Could not drop Redshift table '{resource['table']}': {e}")
+
+
+        elif rtype == "redshift_cluster":
+
+            # "type": "redshift_cluster" means we remove an entire cluster, possibly dropping a schema/table first
+
+            print(f"\nDeleting Redshift cluster '{resource.get('cluster_identifier')}'...")
+
+            import psycopg2
+
+            deleted_successfully = False
+
+            user = resource.get("master_username", "admin")
+
+            password = resource.get("master_password", "")
+
+            host = resource.get("host", "")
+
+            port = resource.get("port", 5439)
+
+            db_name = resource.get("database", "dev")
+
+            schema = resource.get("schema", "fake_schema")
+
+            table = resource.get("table", "fake_data")
+
+            region = resource.get("region", "us-east-1")
+
+            # Attempt to drop table & schema
+
+            try:
+
+                conn = psycopg2.connect(dbname=db_name, user=user, password=password, host=host, port=port)
+
+                cursor = conn.cursor()
+
+                cursor.execute(f"DROP TABLE IF EXISTS {schema}.{table}")
+
+                cursor.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+                conn.commit()
+
+                cursor.close()
+
+                conn.close()
+
+                print(f"Dropped table '{schema}.{table}' and schema '{schema}'.")
+
+            except Exception as e:
+
+                print(f"Could not drop Redshift table/schema: {e}")
+
+            # Now delete cluster
+
+            redshift_client = boto3.client(
+
+                "redshift",
+
+                region_name=region,
+
+                aws_access_key_id=aws_access_key_id,
+
+                aws_secret_access_key=aws_secret_access_key
+
+            )
+
+            try:
+
+                redshift_client.delete_cluster(
+
+                    ClusterIdentifier=resource["cluster_identifier"],
+
+                    SkipFinalClusterSnapshot=True
+
+                )
+
+                waiter = redshift_client.get_waiter("cluster_deleted")
+
+                waiter.wait(ClusterIdentifier=resource["cluster_identifier"])
+
+                print(f"Redshift cluster '{resource['cluster_identifier']}' fully deleted.")
+
+                deleted_successfully = True
+
+            except Exception as e:
+
+                print(f"Could not delete Redshift cluster '{resource['cluster_identifier']}': {e}")
+
 
         elif rtype == "rds_instance":
-            # e.g., MySQL or Postgres on RDS
-            print(f"\nDeleting RDS instance '{resource['db_instance_id']}' with engine '{resource['engine']}'...")
 
-            rds_client = boto3.client(
-                "rds",
-                region_name=resource["region"],
-                aws_access_key_id=aws_access_key_id,
-                aws_secret_access_key=aws_secret_access_key
-            )
-            engine = resource["engine"]
+            # For example, "RDS instance 'DSPM-Data-Gen-MySQL' (engine 'mysql')"
+
+            engine = resource.get("engine", "mysql")
+
+            db_instance_id = resource["db_instance_id"]
+
+            region = resource.get("region", "us-east-1")
+
             endpoint = resource.get("endpoint", "")
+
             port = resource.get("port", 3306)
+
             final_db_name = resource.get("db_name", "test_db")
+
             user = resource.get("master_username", "admin")
+
             pw = resource.get("master_password", "")
 
-            # Attempt to drop the table if the DB is reachable
+            print(f"\nDeleting RDS instance '{db_instance_id}' with engine '{engine}' in region '{region}'...")
+
+            # If the engine is MySQL or MariaDB, attempt to drop 'fake_data' table
+
             if engine in ("aurora-mysql", "mysql", "mariadb"):
-                print("Dropping the 'fake_data' table from RDS MySQL instance (if it exists)...")
+
+                print("Attempting to drop the 'fake_data' table from RDS MySQL instance (if it exists).")
+
                 try:
+
                     import mysql.connector
+
                     conn = mysql.connector.connect(
+
                         host=endpoint,
+
                         user=user,
+
                         password=pw,
+
                         database=final_db_name,
+
                         port=port
+
                     )
+
                     cursor = conn.cursor()
+
                     cursor.execute("DROP TABLE IF EXISTS fake_data")
+
                     conn.commit()
+
                     cursor.close()
+
                     conn.close()
-                    print("Dropped MySQL-compatible RDS table 'fake_data'.")
+
+                    print("Dropped 'fake_data' table (if it existed).")
+
                 except Exception as e:
-                    print(f"Could not drop RDS table 'fake_data': {e}")
+
+                    print(f"Could not drop table 'fake_data': {e}")
+
+
+            # If the engine is Postgres, attempt to drop 'fake_data'
+
             elif engine == "postgres":
-                print("Dropping the 'fake_data' table from RDS Postgres instance (if it exists)...")
+
+                print("Attempting to drop the 'fake_data' table from RDS Postgres instance (if it exists).")
+
                 try:
+
                     import psycopg2
+
                     conn = psycopg2.connect(
+
                         dbname=final_db_name,
+
                         user=user,
+
                         password=pw,
+
                         host=endpoint,
+
                         port=port
+
                     )
+
                     cursor = conn.cursor()
+
                     cursor.execute("DROP TABLE IF EXISTS fake_data")
+
                     conn.commit()
+
                     cursor.close()
+
                     conn.close()
-                    print("Dropped PostgreSQL RDS table 'fake_data'.")
+
+                    print("Dropped 'fake_data' table (if it existed).")
+
                 except Exception as e:
-                    print(f"Could not drop RDS Postgres table 'fake_data': {e}")
+
+                    print(f"Could not drop table 'fake_data': {e}")
 
             # Now delete the DB instance
+
+            import boto3
+
+            from botocore.exceptions import ClientError
+
+            rds_client = boto3.client(
+
+                "rds",
+
+                region_name=region,
+
+                aws_access_key_id=aws_access_key_id,
+
+                aws_secret_access_key=aws_secret_access_key
+
+            )
+
+            deleted_successfully = False
+
             try:
+
                 rds_client.delete_db_instance(
-                    DBInstanceIdentifier=resource["db_instance_id"],
+
+                    DBInstanceIdentifier=db_instance_id,
+
                     SkipFinalSnapshot=True
+
                 )
-                # Wait for it to vanish
-                status = "deleting"
+
+                print(f"RDS instance '{db_instance_id}' is being deleted. Waiting for it to vanish...")
+
+                # Wait until the DBInstanceNotFound error occurs
+
                 while True:
+
                     time.sleep(30)
+
                     try:
-                        desc = rds_client.describe_db_instances(DBInstanceIdentifier=resource["db_instance_id"])
+
+                        desc = rds_client.describe_db_instances(DBInstanceIdentifier=db_instance_id)
+
                         status = desc["DBInstances"][0]["DBInstanceStatus"]
-                        print(f"RDS instance '{resource['db_instance_id']}' status: {status} (waiting for 'not found')")
+
+                        print(f"Current status: {status} (still waiting for 'DBInstanceNotFound')")
+
                     except ClientError as e:
+
                         if "DBInstanceNotFound" in str(e):
-                            print(f"RDS instance '{resource['db_instance_id']}' fully deleted.")
+
+                            print(f"RDS instance '{db_instance_id}' is fully deleted.")
+
                             deleted_successfully = True
+
                             break
+
+                        else:
+
+                            print(f"Error while checking DB instance: {e}")
+
+                            break
+
             except Exception as e:
-                print(f"Error deleting RDS instance '{resource['db_instance_id']}': {e}")
+
+                print(f"Error deleting RDS instance '{db_instance_id}': {e}")
+
+            # If deletion was fully successful, set the flag
+
+            if deleted_successfully:
+                resources_to_remove.append(idx)
+
+                print(f"Successfully deleted RDS instance '{db_instance_id}', removing from resources file.")
+
+
         else:
             print(f"\nUnknown resource type: {rtype}. Skipping.")
 
-        # 5) If deletion succeeded, remove resource from the list
+        # 6) If successfully deleted, mark for removal
         if deleted_successfully:
-            # Mark this resource to remove from the JSON list
             resources_to_remove.append(idx)
-
-            # Immediately save changes to keep the file in sync
-            # We'll remove them after the loop so as not to mess up iteration indexes
-            # or we can remove in-place if we iterate in reverse, etc.
-            # Easiest is to store the indexes, then remove them after the loop
             print(f"Successfully deleted {name_for_display}, will remove from resources file.")
 
-    # 6) Actually remove resources in reverse order so the indices remain valid
+    # 7) Remove them in reverse order to avoid index shifting
     for idx in sorted(resources_to_remove, reverse=True):
         del data["resources"][idx]
 
-    # 7) Save the updated file
     save_resources_file(data)
-
     print("\nCleanup complete. You can now safely remove the resources file if desired.")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1359,8 +1519,6 @@ def main():
     # Process each service
     for svc in requested_services:
         if svc == "mysql":
-            # Instead of prompting for local DB host/user/password,
-            # call insert_data_aws_mysql, which creates an AWS RDS instance.
             insert_data_aws_mysql(
                 num_rows,
                 aws_access_key_id=args.aws_access_key_id,
