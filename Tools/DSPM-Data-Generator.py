@@ -471,56 +471,241 @@ def insert_data_redshift(num_rows, aws_access_key_id=None, aws_secret_access_key
             conn.close()
 
 
-def insert_data_mysql(num_rows, db_host, db_user, db_password, db_name):
+def insert_data_aws_mysql(num_rows, aws_access_key_id=None, aws_secret_access_key=None, region_name=None):
+    """
+    Creates or reuses an AWS RDS MySQL instance, authorizes inbound from your NAT IP,
+    waits for the DB to be available, connects, creates the 'fake_data' table,
+    inserts synthetic rows, and logs it in resources_created.json.
+    """
+    import boto3
     import mysql.connector
-    generator = faker.Faker()
+    import random
+    import string
+    import time
+    from botocore.exceptions import ClientError
+
+    # We'll import the existing load/save helpers and "faker"
     resources = load_resources_file()
+    generator = faker.Faker()
 
-    show_loading("Establishing MySQL connection", 2)
+    if not aws_access_key_id:
+        aws_access_key_id = maskpass.askpass(prompt="Enter AWS Access Key ID (hidden): ", mask='*')
+    if not aws_secret_access_key:
+        aws_secret_access_key = maskpass.askpass(prompt="Enter AWS Secret Access Key (hidden): ", mask='*')
+    if not region_name:
+        region_name = input("Enter AWS region name [us-east-1]: ").strip() or "us-east-1"
+
+    rds_client = boto3.client(
+        "rds",
+        region_name=region_name,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key
+    )
+    ec2 = boto3.client(
+        "ec2",
+        region_name=region_name,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key
+    )
+
+    # 1) Ask user for DB instance ID
+    db_instance_id = input("Enter RDS MySQL DBInstanceIdentifier [DSPM-Data-Gen-MySQL]: ").strip() or "DSPM-Data-Gen-MySQL"
+
+    # 2) Possibly re-use credentials from resources file if we already have an entry
+    existing_rds_entry = None
+    if "resources" in resources:
+        for r in resources["resources"]:
+            if r.get("type") == "rds_instance" and r.get("db_instance_id") == db_instance_id:
+                existing_rds_entry = r
+                break
+
+    if existing_rds_entry:
+        print(f"Found existing RDS instance in resources file for '{db_instance_id}'. Re-using credentials.")
+        master_username = existing_rds_entry.get("master_username", "admin")
+        master_password = existing_rds_entry.get("master_password", "")
+    else:
+        # If user doesn't supply them, generate random
+        master_username = input("Enter RDS MySQL master username (leave blank to auto-generate): ").strip()
+        if not master_username:
+            master_username = "admin"
+        user_provided_password = maskpass.askpass(prompt="Enter RDS MySQL master password (hidden) or leave blank to auto-generate: ", mask='*')
+        if user_provided_password:
+            master_password = user_provided_password
+        else:
+            # random pass
+            master_password = "Passw0rd_" + "".join(random.choices(string.ascii_letters + string.digits, k=8))
+
+    # 3) NAT CIDR for inbound
+    nat_cidr = input("Enter your NAT/public IP in CIDR notation (e.g. 1.2.3.4/32) or leave blank to auto-detect: ").strip()
+    if not nat_cidr:
+        print("No IP given, fetching from https://checkip.amazonaws.com ...")
+        try:
+            import requests
+            my_ip = requests.get("https://checkip.amazonaws.com").text.strip()
+            nat_cidr = f"{my_ip}/32"
+            print(f"Using detected IP: {nat_cidr}")
+        except Exception as e:
+            print(f"Could not fetch your IP automatically: {e}")
+            return
+
+    # 4) Create or reuse a security group allowing inbound MySQL (port 3306)
+    try:
+        response = ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
+        if response["Vpcs"]:
+            default_vpc_id = response["Vpcs"][0]["VpcId"]
+            print(f"Found default VPC: {default_vpc_id}")
+        else:
+            default_vpc_id = input("No default VPC. Please enter a VPC ID: ").strip()
+    except Exception as e:
+        print(f"Error describing VPCs: {e}")
+        return
+
+    sg_name = "MyMySQLInboundSG"
+    sg_id = None
 
     try:
-        conn = mysql.connector.connect(host=db_host, user=db_user, password=db_password)
-        cursor = conn.cursor()
-        cursor.execute("SHOW DATABASES")
-        databases = [db[0] for db in cursor.fetchall()]
+        sg_desc = ec2.describe_security_groups(Filters=[
+            {"Name": "group-name", "Values": [sg_name]},
+            {"Name": "vpc-id", "Values": [default_vpc_id]}
+        ])
+        if sg_desc["SecurityGroups"]:
+            sg_id = sg_desc["SecurityGroups"][0]["GroupId"]
+            print(f"Security group '{sg_name}' already exists (ID '{sg_id}'). Reusing it.")
+        else:
+            print(f"Creating security group '{sg_name}' in VPC '{default_vpc_id}'...")
+            create_resp = ec2.create_security_group(
+                GroupName=sg_name,
+                Description="Allow inbound MySQL from NAT IP",
+                VpcId=default_vpc_id
+            )
+            sg_id = create_resp["GroupId"]
+            print(f"Created security group with ID '{sg_id}'.")
+    except ClientError as e:
+        print(f"Error creating/finding security group: {e}")
+        return
 
-        if db_name not in databases:
-            create_db = input(
-                f"The database '{db_name}' does not exist. Create it? (yes/no) [no]: "
-            ).strip().lower()
-            if create_db == "yes":
-                cursor.execute(f"CREATE DATABASE {db_name}")
-                print(f"Database '{db_name}' created.")
-            else:
-                print("The specified database does not exist and cannot be created. Exiting.")
-                sys.exit(1)
+    # Authorize inbound on 3306
+    try:
+        print(f"Authorizing inbound on port 3306 from {nat_cidr} in SG {sg_id}...")
+        ec2.authorize_security_group_ingress(
+            GroupId=sg_id,
+            IpPermissions=[
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 3306,
+                    "ToPort": 3306,
+                    "IpRanges": [{"CidrIp": nat_cidr, "Description": "MySQL inbound"}]
+                }
+            ]
+        )
+        print("Inbound rule set.")
+    except ClientError as e:
+        if "InvalidPermission.Duplicate" in str(e):
+            print("Inbound rule already exists, continuing.")
+        else:
+            print(f"Error authorizing inbound rule: {e}")
 
-        cursor.close()
-        conn.close()
-    except mysql.connector.Error as err:
-        print(f"Database connection error: {err}")
-        sys.exit(1)
+    # 5) Check if DB instance exists
+    instance_exists = False
+    try:
+        desc = rds_client.describe_db_instances(DBInstanceIdentifier=db_instance_id)
+        if desc and desc["DBInstances"]:
+            instance_exists = True
+            print(f"RDS instance '{db_instance_id}' already exists; not creating new.")
+    except ClientError as e:
+        if "DBInstanceNotFound" in str(e):
+            # Need to create
+            print(f"Creating RDS MySQL instance '{db_instance_id}' with master user '{master_username}' ...")
+            try:
+                rds_client.create_db_instance(
+                    DBInstanceIdentifier=db_instance_id,
+                    AllocatedStorage=5,
+                    DBName="test_db",  # initial DB to create
+                    Engine="mysql",
+                    DBInstanceClass="db.t3.micro",
+                    PubliclyAccessible=True,
+                    VpcSecurityGroupIds=[sg_id],
+                    MasterUsername=master_username,
+                    MasterUserPassword=master_password,
+                    BackupRetentionPeriod=0,  # effectively disables backups
+                    StorageType="gp2"
+                )
+                print("RDS MySQL creation initiated. Waiting for 'available' status...")
+                status = "creating"
+                while status != "available":
+                    time.sleep(30)
+                    d = rds_client.describe_db_instances(DBInstanceIdentifier=db_instance_id)
+                    status = d["DBInstances"][0]["DBInstanceStatus"]
+                    print(f"Status: {status} (waiting for 'available')")
 
-    show_loading("Inserting data into MySQL", 2)
+                print(f"RDS MySQL instance '{db_instance_id}' is now available.")
+            except Exception as ce:
+                print(f"Error creating MySQL instance: {ce}")
+                return
+        else:
+            print(f"Error describing DB instance: {e}")
+            return
+
+    # 6) Retrieve the endpoint, port
+    desc2 = rds_client.describe_db_instances(DBInstanceIdentifier=db_instance_id)
+    db_info = desc2["DBInstances"][0]
+    endpoint = db_info["Endpoint"]["Address"]
+    port = db_info["Endpoint"]["Port"]
+
+    # We'll create or reuse the final DB name "test_db" for the data
+    final_db_name = "test_db"
+
+    # 7) Insert data
+    show_loading(f"Connecting to MySQL at {endpoint}:{port} / DB: {final_db_name}", 4)
 
     try:
+        # Connect to the main DB
         conn = mysql.connector.connect(
-            host=db_host, user=db_user, password=db_password, database=db_name
+            host=endpoint,
+            user=master_username,
+            password=master_password,
+            database=final_db_name,
+            port=port
         )
         cursor = conn.cursor()
 
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS fake_data (
-            first_name VARCHAR(50), middle_name VARCHAR(50), last_name VARCHAR(50), gender VARCHAR(70),
-            date_of_birth DATE, marital_status VARCHAR(70), nationality VARCHAR(50), email_address VARCHAR(100),
-            secondary_email_address VARCHAR(100), phone_number VARCHAR(70), secondary_phone_number VARCHAR(70),
-            street_address VARCHAR(200), city VARCHAR(50), state_province VARCHAR(50), postal_code VARCHAR(70),
-            country VARCHAR(50), passport_number VARCHAR(70), drivers_license_number VARCHAR(70),
-            health_insurance_number VARCHAR(70), medical_record_number VARCHAR(70), blood_type VARCHAR(5),
-            allergies VARCHAR(100), chronic_conditions VARCHAR(100), medications VARCHAR(100),
-            job_title VARCHAR(100), department VARCHAR(50), employee_id VARCHAR(70), employer_name VARCHAR(100),
-            work_email_address VARCHAR(100), student_id VARCHAR(70), university_college_name VARCHAR(100),
-            degree VARCHAR(10), graduation_year INT, credit_card_number VARCHAR(70), bank_account_number VARCHAR(30),
+            first_name VARCHAR(50),
+            middle_name VARCHAR(50),
+            last_name VARCHAR(50),
+            gender VARCHAR(70),
+            date_of_birth DATE,
+            marital_status VARCHAR(70),
+            nationality VARCHAR(50),
+            email_address VARCHAR(100),
+            secondary_email_address VARCHAR(100),
+            phone_number VARCHAR(70),
+            secondary_phone_number VARCHAR(70),
+            street_address VARCHAR(200),
+            city VARCHAR(50),
+            state_province VARCHAR(50),
+            postal_code VARCHAR(70),
+            country VARCHAR(50),
+            passport_number VARCHAR(70),
+            drivers_license_number VARCHAR(70),
+            health_insurance_number VARCHAR(70),
+            medical_record_number VARCHAR(70),
+            blood_type VARCHAR(5),
+            allergies VARCHAR(100),
+            chronic_conditions VARCHAR(100),
+            medications VARCHAR(100),
+            job_title VARCHAR(100),
+            department VARCHAR(50),
+            employee_id VARCHAR(70),
+            employer_name VARCHAR(100),
+            work_email_address VARCHAR(100),
+            student_id VARCHAR(70),
+            university_college_name VARCHAR(100),
+            degree VARCHAR(10),
+            graduation_year INT,
+            credit_card_number VARCHAR(70),
+            bank_account_number VARCHAR(30),
             iban VARCHAR(34)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
@@ -538,40 +723,59 @@ def insert_data_mysql(num_rows, db_host, db_user, db_password, db_name):
         """
 
         for _ in range(num_rows):
-            record = generate_fake_record(generator)
+            rec = generate_fake_record(generator)
             values = (
-                record["first_name"], record["middle_name"], record["last_name"], record["gender"],
-                record["date_of_birth"], record["marital_status"], record["nationality"],
-                record["email_address"], record["secondary_email_address"], record["phone_number"],
-                record["secondary_phone_number"], record["street_address"], record["city"],
-                record["state_province"], record["postal_code"], record["country"], record["passport_number"],
-                record["drivers_license_number"], record["health_insurance_number"], record["medical_record_number"],
-                record["blood_type"], record["allergies"], record["chronic_conditions"], record["medications"],
-                record["job_title"], record["department"], record["employee_id"], record["employer_name"],
-                record["work_email_address"], record["student_id"], record["university_college_name"],
-                record["degree"], record["graduation_year"], record["credit_card_number"],
-                record["bank_account_number"], record["iban"]
+                rec["first_name"], rec["middle_name"], rec["last_name"], rec["gender"],
+                rec["date_of_birth"], rec["marital_status"], rec["nationality"],
+                rec["email_address"], rec["secondary_email_address"], rec["phone_number"],
+                rec["secondary_phone_number"], rec["street_address"], rec["city"],
+                rec["state_province"], rec["postal_code"], rec["country"], rec["passport_number"],
+                rec["drivers_license_number"], rec["health_insurance_number"], rec["medical_record_number"],
+                rec["blood_type"], rec["allergies"], rec["chronic_conditions"], rec["medications"],
+                rec["job_title"], rec["department"], rec["employee_id"], rec["employer_name"],
+                rec["work_email_address"], rec["student_id"], rec["university_college_name"],
+                rec["degree"], rec["graduation_year"], rec["credit_card_number"],
+                rec["bank_account_number"], rec["iban"]
             )
             cursor.execute(dml, values)
 
         conn.commit()
-        print(f"{num_rows} rows inserted into MySQL table 'fake_data'.")
-        mysql_entry = {
-            "type": "mysql",
-            "db_host": db_host,
-            "db_name": db_name,
-            "table": "fake_data"
-        }
-        if "resources" not in resources:
-            resources["resources"] = []
-        resources["resources"].append(mysql_entry)
-        save_resources_file(resources)
-
-    except mysql.connector.Error as err:
-        print(f"Error inserting data: {err}")
+        print(f"{num_rows} rows inserted into RDS MySQL table 'fake_data' in DB '{final_db_name}'.")
+    except Exception as e:
+        print(f"Error inserting data into RDS MySQL: {e}")
     finally:
-        cursor.close()
-        conn.close()
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
+            conn.close()
+
+    # 8) Log resource in resources_created.json
+    rds_entry = None
+    if "resources" not in resources:
+        resources["resources"] = []
+
+    for r in resources["resources"]:
+        if r.get("type") == "rds_instance" and r.get("db_instance_id") == db_instance_id:
+            rds_entry = r
+            break
+
+    if not rds_entry:
+        rds_entry = {
+            "type": "rds_instance",
+            "db_instance_id": db_instance_id,
+            "engine": "mysql",
+            "endpoint": endpoint,
+            "port": port,
+            "db_name": final_db_name,
+            "region": region_name
+        }
+        resources["resources"].append(rds_entry)
+
+    rds_entry["master_username"] = master_username
+    rds_entry["master_password"] = master_password
+
+    save_resources_file(resources)
+    print(f"Saved resource info for '{db_instance_id}' in resources_created.json.\n")
 
 def insert_data_dynamodb(num_rows, aws_access_key_id=None, aws_secret_access_key=None, region_name=None):
     import boto3
@@ -661,9 +865,12 @@ def upload_data_s3(num_rows, aws_access_key_id=None, aws_secret_access_key=None,
     import boto3
     import csv
     from io import StringIO
+    import time
+    from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 
     resources = load_resources_file()
 
+    # Prompt for AWS creds/region if not provided
     if not aws_access_key_id:
         aws_access_key_id = maskpass.askpass(prompt="Enter AWS Access Key ID (input hidden): ", mask='*')
     if not aws_secret_access_key:
@@ -671,6 +878,7 @@ def upload_data_s3(num_rows, aws_access_key_id=None, aws_secret_access_key=None,
     if not region_name:
         region_name = input("Enter AWS region name [us-east-1]: ").strip() or "us-east-1"
 
+    # Initialize S3 session/client
     s3_session = boto3.Session(
         aws_access_key_id=aws_access_key_id,
         aws_secret_access_key=aws_secret_access_key,
@@ -678,11 +886,33 @@ def upload_data_s3(num_rows, aws_access_key_id=None, aws_secret_access_key=None,
     )
     s3 = s3_session.client('s3')
 
-    bucket_name = input("Enter S3 bucket name: ").strip()
+    # Generate a temporary bucket name like: dspm-data-gen-1679516814
+    epoch_time = int(time.time())
+    bucket_name = f"dspm-data-gen-{epoch_time}"
+    print(f"Using temporary bucket name: {bucket_name}")
+    # We'll still let user pick the object name
     object_name = input("Enter the S3 object name [fake_data.csv]: ").strip() or "fake_data.csv"
 
+    # Attempt to create the temporary bucket
+    print(f"Creating temporary bucket '{bucket_name}' in region '{region_name}'...")
+    try:
+        # For regions other than us-east-1, we must specify a LocationConstraint
+        if region_name == "us-east-1":
+            s3.create_bucket(Bucket=bucket_name)
+        else:
+            s3.create_bucket(
+                Bucket=bucket_name,
+                CreateBucketConfiguration={'LocationConstraint': region_name}
+            )
+        print(f"Bucket '{bucket_name}' created successfully.")
+    except ClientError as e:
+        print(f"Error creating bucket '{bucket_name}': {e}")
+        return
+
+    # Initialize Faker
     generator = faker.Faker()
 
+    # Generate CSV data in memory
     output = StringIO()
     writer = csv.writer(output)
     header = [
@@ -697,7 +927,6 @@ def upload_data_s3(num_rows, aws_access_key_id=None, aws_secret_access_key=None,
     writer.writerow(header)
 
     show_loading("Generating CSV for S3", 2)
-
     for _ in range(num_rows):
         record = generate_fake_record(generator)
         row = [
@@ -722,6 +951,8 @@ def upload_data_s3(num_rows, aws_access_key_id=None, aws_secret_access_key=None,
     try:
         s3.put_object(Bucket=bucket_name, Key=object_name, Body=data_bytes)
         print(f"{num_rows} rows uploaded to s3://{bucket_name}/{object_name}")
+
+        # Log this new S3 resource in resources file
         s3_entry = {
             "type": "s3",
             "bucket": bucket_name,
@@ -752,15 +983,19 @@ def upload_data_s3(num_rows, aws_access_key_id=None, aws_secret_access_key=None,
     except Exception as e:
         print(f"An unknown error occurred during S3 upload: {e}")
 
-def cleanup_resources():
+
+def cleanup_resources(aws_access_key_id=None, aws_secret_access_key=None):
     """
-    Reads from resources_created.json, attempts to delete all resources that the script created,
-    including Redshift clusters, MySQL data, DynamoDB tables, and S3 uploads.
+    Reads from resources_created.json, asks once for AWS credentials if needed,
+    then for each resource, asks if you'd like to delete it.
+    If yes, performs deletion logic; if no, skips it.
+    On successful deletion, removes that resource from the file.
     """
     import boto3
     import psycopg2
     import mysql.connector
 
+    # 1) Load the resources file
     if not os.path.exists(RESOURCES_FILE):
         print("\nNo resources file found; nothing to clean up.")
         return
@@ -776,12 +1011,60 @@ def cleanup_resources():
         print("\nNo resources recorded; nothing to clean up.")
         return
 
-    print("\nCleaning up / Destroying resources created by this script...")
-    for resource in data["resources"]:
+    # 2) Check if we even have any AWS resources to delete
+    aws_resources_present = any(
+        r.get("type") in ("dynamodb","redshift","redshift_cluster","s3","rds_instance")
+        for r in data["resources"]
+    )
+    print("\nResources to clean up:")
+    print((aws_access_key_id, aws_secret_access_key))
+    if aws_access_key_id is None or aws_secret_access_key is None:
+        print("\nNo AWS credentials provided. Will prompt for them if needed.")
+    else:
+        print("\nUsing provided AWS credentials for cleanup.")
+
+    # If we have any AWS resources, ensure we have creds
+    if aws_resources_present and (aws_access_key_id is None or aws_secret_access_key is None):
+        print("\nWe have AWS resources to delete. Please provide your AWS credentials once.")
+        aws_access_key_id = maskpass.askpass(prompt="Enter AWS Access Key ID (hidden): ", mask='*')
+        aws_secret_access_key = maskpass.askpass(prompt="Enter AWS Secret Access Key (hidden): ", mask='*')
+        print("\nGot AWS credentials. Will use them for all AWS resources needing cleanup.\n")
+
+    print("Cleaning up / Destroying resources created by this script...")
+
+    # We'll store indices or references to resources we have successfully deleted
+    # so we can remove them from data["resources"] afterwards.
+    resources_to_remove = []
+
+    for idx, resource in enumerate(data["resources"]):
         rtype = resource.get("type", "")
+
+        # 3) Ask if the user wants to delete this resource
         if rtype == "mysql":
-            import mysql.connector
-            print(f"\nDropping MySQL table '{resource['table']}' in DB '{resource['db_name']}' on host '{resource['db_host']}'...")
+            name_for_display = f"MySQL table '{resource['table']}' in DB '{resource['db_name']}' on host '{resource['db_host']}'"
+        elif rtype == "dynamodb":
+            name_for_display = f"DynamoDB table '{resource['table_name']}' in region '{resource['region']}'"
+        elif rtype == "redshift":
+            name_for_display = f"Redshift table '{resource['table']}' in DB '{resource['database']}' on '{resource['host']}:{resource['port']}'"
+        elif rtype == "redshift_cluster":
+            name_for_display = f"Redshift cluster '{resource['cluster_identifier']}'"
+        elif rtype == "s3":
+            name_for_display = f"S3 object '{resource['object_key']}' in bucket '{resource['bucket']}' (region '{resource['region']}')"
+        elif rtype == "rds_instance":
+            name_for_display = f"RDS instance '{resource['db_instance_id']}' (engine '{resource.get('engine','mysql')}')"
+        else:
+            name_for_display = f"Unknown resource type: {rtype}."
+
+        confirm = input(f"\nWould you like to delete this resource? {name_for_display} (yes/no) [yes]: ").strip().lower() or "yes"
+        if confirm not in ("yes","y"):
+            print(f"Skipping deletion of {name_for_display}.")
+            continue
+
+        # 4) Perform the actual deletion logic
+        deleted_successfully = False  # track if the deletion was successful
+
+        if rtype == "mysql":
+            print(f"\nDeleting {name_for_display} ...")
             db_host = resource["db_host"]
             db_name = resource["db_name"]
             table = resource["table"]
@@ -793,6 +1076,7 @@ def cleanup_resources():
                 cursor.execute(f"DROP TABLE IF EXISTS {table}")
                 conn.commit()
                 print(f"Table '{table}' dropped.")
+                deleted_successfully = True
             except mysql.connector.Error as err:
                 print(f"MySQL table drop error: {err}")
             finally:
@@ -803,28 +1087,30 @@ def cleanup_resources():
 
         elif rtype == "dynamodb":
             import boto3
-            aws_access_key_id = maskpass.askpass(prompt="Enter AWS Access Key ID (input hidden): ", mask='*')
-            aws_secret_access_key = maskpass.askpass(prompt="Enter AWS Secret Access Key (input hidden): ", mask='*')
+            region = resource["region"]
             session = boto3.Session(
                 aws_access_key_id=aws_access_key_id,
                 aws_secret_access_key=aws_secret_access_key,
-                region_name=resource["region"]
+                region_name=region
             )
             ddb_client = session.client('dynamodb')
+            table_name = resource["table_name"]
+            print(f"\nDeleting DynamoDB table '{table_name}' in region '{region}'...")
             try:
-                print(f"\nDeleting DynamoDB table '{resource['table_name']}' in region '{resource['region']}'...")
-                ddb_client.delete_table(TableName=resource["table_name"])
+                ddb_client.delete_table(TableName=table_name)
                 waiter = ddb_client.get_waiter('table_not_exists')
-                waiter.wait(TableName=resource["table_name"])
-                print(f"Table '{resource['table_name']}' deleted.")
+                waiter.wait(TableName=table_name)
+                print(f"Table '{table_name}' deleted.")
+                deleted_successfully = True
             except ClientError as e:
-                print(f"Error deleting DynamoDB table '{resource['table_name']}': {e}")
+                print(f"Error deleting DynamoDB table '{table_name}': {e}")
 
         elif rtype == "redshift":
             # older "redshift" type logic, if any
-            print(f"\nDropping Redshift table '{resource['table']}' in database '{resource['database']}' on '{resource['host']}:{resource['port']}'...")
+            print(f"\nDeleting {name_for_display} ...")
             user = input("Enter Redshift user: ").strip()
             password = maskpass.askpass(prompt="Enter Redshift password (input hidden): ", mask='*')
+            import psycopg2
             try:
                 conn = psycopg2.connect(
                     dbname=resource["database"],
@@ -837,6 +1123,7 @@ def cleanup_resources():
                 cursor.execute(f"DROP TABLE IF EXISTS {resource['table']}")
                 conn.commit()
                 print(f"Redshift table '{resource['table']}' dropped.")
+                deleted_successfully = True
             except Exception as e:
                 print(f"Could not drop Redshift table '{resource['table']}': {e}")
             finally:
@@ -846,8 +1133,7 @@ def cleanup_resources():
                     conn.close()
 
         elif rtype == "redshift_cluster":
-            # Properly drop table & schema, then delete the entire cluster
-            print(f"\nDropping Redshift cluster '{resource['cluster_identifier']}' and all data.")
+            print(f"\nDeleting {name_for_display} ...")
             import psycopg2
 
             user = resource["master_username"]
@@ -856,8 +1142,6 @@ def cleanup_resources():
             db_name = resource["database"]
             schema = resource["schema"]
             table = resource["table"]
-
-            # Use stored master password if we have it, otherwise prompt
             if "master_password" in resource and resource["master_password"]:
                 password = resource["master_password"]
                 print("Using stored master password from resources file.")
@@ -867,12 +1151,11 @@ def cleanup_resources():
                     mask='*'
                 )
 
+            # Drop table & schema
             try:
                 conn = psycopg2.connect(dbname=db_name, user=user, password=password, host=host, port=port)
                 cursor = conn.cursor()
-                # Drop the table
                 cursor.execute(f"DROP TABLE IF EXISTS {schema}.{table}")
-                # Optionally drop the schema
                 cursor.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
                 conn.commit()
                 print(f"Dropped table '{schema}.{table}' and schema '{schema}'.")
@@ -884,11 +1167,8 @@ def cleanup_resources():
                 if 'conn' in locals():
                     conn.close()
 
-            # Now delete the cluster
-            region = resource.get("region", "us-east-1")  # or store region if needed
-            # Prompt or use stored AWS creds (choose to prompt for safety)
-            aws_access_key_id = maskpass.askpass(prompt="Enter AWS Access Key ID (input hidden): ", mask='*')
-            aws_secret_access_key = maskpass.askpass(prompt="Enter AWS Secret Access Key (input hidden): ", mask='*')
+            # Then delete the cluster
+            region = resource.get("region", "us-east-1")
             redshift_client = boto3.client(
                 "redshift",
                 region_name=region,
@@ -904,28 +1184,124 @@ def cleanup_resources():
                 waiter = redshift_client.get_waiter("cluster_deleted")
                 waiter.wait(ClusterIdentifier=resource["cluster_identifier"])
                 print(f"Cluster '{resource['cluster_identifier']}' has been deleted.")
+                deleted_successfully = True
             except Exception as e:
                 print(f"Could not delete Redshift cluster '{resource['cluster_identifier']}': {e}")
 
         elif rtype == "s3":
-            print(f"\nDeleting S3 object '{resource['object_key']}' from bucket '{resource['bucket']}' in region '{resource['region']}'...")
-            import boto3
-            aws_access_key_id = maskpass.askpass(prompt="Enter AWS Access Key ID (input hidden): ", mask='*')
-            aws_secret_access_key = maskpass.askpass(prompt="Enter AWS Secret Access Key (input hidden): ", mask='*')
+            print(f"\nDeleting {name_for_display} ...")
+            region = resource["region"]
             s3_session = boto3.Session(
                 aws_access_key_id=aws_access_key_id,
                 aws_secret_access_key=aws_secret_access_key,
-                region_name=resource["region"]
+                region_name=region
             )
             s3_client = s3_session.client('s3')
             try:
                 s3_client.delete_object(Bucket=resource["bucket"], Key=resource["object_key"])
                 print(f"S3 object '{resource['object_key']}' deleted.")
+                deleted_successfully = True
             except ClientError as e:
                 print(f"Could not delete S3 object '{resource['object_key']}': {e}")
 
+        elif rtype == "rds_instance":
+            # e.g., MySQL or Postgres on RDS
+            print(f"\nDeleting RDS instance '{resource['db_instance_id']}' with engine '{resource['engine']}'...")
+
+            rds_client = boto3.client(
+                "rds",
+                region_name=resource["region"],
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key
+            )
+            engine = resource["engine"]
+            endpoint = resource.get("endpoint", "")
+            port = resource.get("port", 3306)
+            final_db_name = resource.get("db_name", "test_db")
+            user = resource.get("master_username", "admin")
+            pw = resource.get("master_password", "")
+
+            # Attempt to drop the table if the DB is reachable
+            if engine in ("aurora-mysql", "mysql", "mariadb"):
+                print("Dropping the 'fake_data' table from RDS MySQL instance (if it exists)...")
+                try:
+                    import mysql.connector
+                    conn = mysql.connector.connect(
+                        host=endpoint,
+                        user=user,
+                        password=pw,
+                        database=final_db_name,
+                        port=port
+                    )
+                    cursor = conn.cursor()
+                    cursor.execute("DROP TABLE IF EXISTS fake_data")
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+                    print("Dropped MySQL-compatible RDS table 'fake_data'.")
+                except Exception as e:
+                    print(f"Could not drop RDS table 'fake_data': {e}")
+            elif engine == "postgres":
+                print("Dropping the 'fake_data' table from RDS Postgres instance (if it exists)...")
+                try:
+                    import psycopg2
+                    conn = psycopg2.connect(
+                        dbname=final_db_name,
+                        user=user,
+                        password=pw,
+                        host=endpoint,
+                        port=port
+                    )
+                    cursor = conn.cursor()
+                    cursor.execute("DROP TABLE IF EXISTS fake_data")
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+                    print("Dropped PostgreSQL RDS table 'fake_data'.")
+                except Exception as e:
+                    print(f"Could not drop RDS Postgres table 'fake_data': {e}")
+
+            # Now delete the DB instance
+            try:
+                rds_client.delete_db_instance(
+                    DBInstanceIdentifier=resource["db_instance_id"],
+                    SkipFinalSnapshot=True
+                )
+                # Wait for it to vanish
+                status = "deleting"
+                while True:
+                    time.sleep(30)
+                    try:
+                        desc = rds_client.describe_db_instances(DBInstanceIdentifier=resource["db_instance_id"])
+                        status = desc["DBInstances"][0]["DBInstanceStatus"]
+                        print(f"RDS instance '{resource['db_instance_id']}' status: {status} (waiting for 'not found')")
+                    except ClientError as e:
+                        if "DBInstanceNotFound" in str(e):
+                            print(f"RDS instance '{resource['db_instance_id']}' fully deleted.")
+                            deleted_successfully = True
+                            break
+            except Exception as e:
+                print(f"Error deleting RDS instance '{resource['db_instance_id']}': {e}")
         else:
             print(f"\nUnknown resource type: {rtype}. Skipping.")
+
+        # 5) If deletion succeeded, remove resource from the list
+        if deleted_successfully:
+            # Mark this resource to remove from the JSON list
+            resources_to_remove.append(idx)
+
+            # Immediately save changes to keep the file in sync
+            # We'll remove them after the loop so as not to mess up iteration indexes
+            # or we can remove in-place if we iterate in reverse, etc.
+            # Easiest is to store the indexes, then remove them after the loop
+            print(f"Successfully deleted {name_for_display}, will remove from resources file.")
+
+    # 6) Actually remove resources in reverse order so the indices remain valid
+    for idx in sorted(resources_to_remove, reverse=True):
+        del data["resources"][idx]
+
+    # 7) Save the updated file
+    save_resources_file(data)
 
     print("\nCleanup complete. You can now safely remove the resources file if desired.")
 
@@ -938,7 +1314,7 @@ def main():
 
     # If not doing cleanup, the user may supply service/rows as normal
     parser.add_argument("--service", type=str,
-                        help="Comma-separated list of services or 'all'. Options: mysql, mariadb, aurora, postgresql, rds, dynamodb, redshift, s3, all.")
+                        help="Comma-separated list of services or 'all'. Options: mysql, dynamodb, redshift, s3, all.")
     parser.add_argument("--num_rows", type=int, help="Number of rows to insert (1-500)")
     parser.add_argument("--db_host", type=str, help="Database host")
     parser.add_argument("--db_user", type=str, help="Database user")
@@ -952,10 +1328,10 @@ def main():
 
     # If cleanup is requested, skip everything else
     if args.cleanup:
-        cleanup_resources()
+        cleanup_resources(args.aws_access_key_id, args.aws_secret_access_key)
         sys.exit(0)
 
-    valid_services = ["mysql", "mariadb", "aurora", "postgresql", "rds", "dynamodb", "redshift", "s3"]
+    valid_services = ["mysql",  "dynamodb", "redshift", "s3"]
     if not args.service:
         print("Error: --service is required unless you specify --cleanup.")
         print(f"Valid services: {', '.join(valid_services)}")
@@ -982,12 +1358,15 @@ def main():
 
     # Process each service
     for svc in requested_services:
-        if svc in ["mysql", "mariadb", "aurora", "postgresql", "rds"]:
-            db_host = args.db_host if args.db_host else input("Enter the database host [localhost]: ") or "localhost"
-            db_user = args.db_user if args.db_user else input("Enter the database user [root]: ") or "root"
-            db_password = maskpass.askpass(prompt="Enter the database password (input hidden): ", mask='*')
-            db_name = args.db_name if args.db_name else input("Enter the database name [test_db]: ") or "test_db"
-            insert_data_mysql(num_rows, db_host, db_user, db_password, db_name)
+        if svc == "mysql":
+            # Instead of prompting for local DB host/user/password,
+            # call insert_data_aws_mysql, which creates an AWS RDS instance.
+            insert_data_aws_mysql(
+                num_rows,
+                aws_access_key_id=args.aws_access_key_id,
+                aws_secret_access_key=args.aws_secret_access_key,
+                region_name=args.aws_region
+            )
 
         elif svc == "dynamodb":
             insert_data_dynamodb(
