@@ -272,4 +272,4 @@ Contributions welcome! Please:
 
 ---
 
-**Made with ❤️ for Cortex XDR automation**
+**Made with ❤️ for Cortex automation**
