@@ -241,9 +241,7 @@ See `requirements.txt`:
 requests>=2.28.0
 ```
 
-## 📄 License
 
-MIT License - see LICENSE file for details
 
 ## 🤝 Contributing
 
@@ -255,17 +253,6 @@ Contributions welcome! Please:
 4. Push to branch (`git push origin feature/improvement`)
 5. Open a Pull Request
 
-## 🐛 Bug Reports
-
-Please open an issue with:
-- Error message (full stack trace)
-- Steps to reproduce
-- Expected vs. actual behavior
-- Python version and OS
-
-## 📞 Support
-
-For Cortex XDR API questions, see [Palo Alto Networks Documentation](https://docs.paloaltonetworks.com/cortex/cortex-xdr.html)
 
 ## ⚡ Performance Tips
 
