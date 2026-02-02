@@ -39,46 +39,56 @@ pip install -r requirements.txt
 
 ## 🔑 Configuration
 
-### Getting Session Credentials
+### Step 1: Set Your Region and Tenant
 
-The script requires the following credentials from your Cortex XDR session:
-
-1. **Open Cortex XDR** in your browser
-2. **Open DevTools** (F12 or Cmd+Option+I)
-3. **Go to Network tab** and perform an unlink action
-4. **Find the `unlink_issue` request**
-5. **Copy the request headers**:
-   - `Cookie` (session cookies)
-   - `X-CSRF-TOKEN`
-   - `X-XSRF-TOKEN`
-   - `X-XDR-REQUEST-TOKEN`
-
-### Updating the Script
-
-Edit `bulk-unlink-issues.py` and update the configuration section:
+Update these variables at the top of the script:
 
 ```python
-# =============================================================================
-# CONFIGURATION - Update these values from your browser session
-# =============================================================================
-BASE_URL = "https://runtime.xdr.<region>.paloaltonetworks.com"
-CSRF_TOKEN = "your-csrf-token-here"
-XSRF_TOKEN = "Bearer your-xsrf-token-here"
-XDR_REQUEST_TOKEN = "your-request-token-here"
-REFERER = "https://runtime.xdr.<region>.paloaltonetworks.com/case/alerts_and_insights?caseId=YOUR_CASE_ID"
-
-COOKIE = "your-full-cookie-string-here"
+REGION = "jp"              # Your region: us, eu, jp, au, etc.
+TenantName = "XSIAM"       # Your tenant name (from your Cortex XDR URL)
+CASE_ID = 109203           # The case ID you're working with
 ```
 
-### Adding Issues to Unlink
+The script will automatically construct:
+- `BASE_URL = "https://XSIAM.xdr.jp.paloaltonetworks.com"`
+- `REFERER = "https://XSIAM.xdr.jp.paloaltonetworks.com/case/alerts_and_insights?caseId=109203"`
 
-In the `UNLINK_DATA` list, add tuples of `(issue_id, case_id)`:
+### Step 2: Extract Session Credentials
+
+The script requires the following credentials from your active Cortex XDR session:
+
+1. **Open Cortex XDR** in your browser: `https://{TenantName}.xdr.{REGION}.paloaltonetworks.com`
+2. **Open DevTools** (F12 or Cmd+Option+I on Mac)
+3. **Go to Network tab** and perform any action (e.g., navigate to a case)
+4. **Find any API request** in the Network tab
+5. **Right-click → Copy → Copy as cURL** or view the Headers tab
+6. **Extract the following from Request Headers**:
+   - `Cookie` - the entire cookie header value (contains session tokens)
+   - `X-CSRF-TOKEN` - typically a 32-character hexadecimal string
+   - `X-XSRF-TOKEN` - JWT token starting with "Bearer eyJ..."
+   - `X-XDR-REQUEST-TOKEN` - UUID format like "12345678-1234-1234-1234-567812345678"
+
+### Step 3: Update the Script
+
+Edit `bulk-unlink-issues.py` and replace the mock values:
+
+```python
+CSRF_TOKEN = "b0a82900ba3f4643263bb65432dcce83"  # From DevTools
+XSRF_TOKEN = "Bearer eyJhbGci..."                 # Full JWT from DevTools
+XDR_REQUEST_TOKEN = "2136235g-a9v4-41b6..."      # UUID from DevTools
+COOKIE = "app-proxy-hydra-prod-jp=eyJ..."        # Full cookie string from DevTools
+```
+
+### Step 4: Add Issues to Unlink
+
+In the `UNLINK_DATA` list, add your issue IDs. The script uses the `CASE_ID` variable automatically:
 
 ```python
 UNLINK_DATA = [
-    (734717, 109203),
-    (734782, 109203),
-    (734789, 109203),
+    (734414, CASE_ID),
+    (734415, CASE_ID),
+    (734416, CASE_ID),
+    (734417, CASE_ID),
     # ... more issues
 ]
 ```
@@ -97,25 +107,28 @@ python3 bulk-unlink-issues.py
 🚀 Starting bulk unlink operation...
 ⏰ Started at: 2026-02-02 12:48:32
 
-📊 Total operations: 100
+📊 Total operations: 7
 🧵 Concurrent workers: 30
 🔁 Max rounds for failed issues: 5
 
-🔁 Round 1/5 - Pending issues: 100
-[1/100] ✅ Issue 734717 - Success (523ms)
-[2/100] ✅ Issue 734782 - Success (481ms)
-[3/100] ⚠️  Issue 734789 - Retry 1/3 (HTTP 408)
-[3/100] ✅ Issue 734789 - Success (1205ms)
-...
+🔁 Round 1/5 - Pending issues: 7
+[1/7] ✅ Issue 734414 - Success (523ms)
+[2/7] ✅ Issue 734415 - Success (481ms)
+[3/7] ⚠️  Issue 734416 - Retry 1/3 (HTTP 408)
+[3/7] ✅ Issue 734416 - Success (1205ms)
+[4/7] ✅ Issue 734417 - Success (456ms)
+[5/7] ✅ Issue 734418 - Success (512ms)
+[6/7] ✅ Issue 734419 - Success (489ms)
+[7/7] ✅ Issue 734420 - Success (498ms)
 
 ============================================================
 📈 SUMMARY
 ============================================================
 ⏰ Started at:  2026-02-02 12:48:32
-⏰ Finished at: 2026-02-02 12:52:45
-⏱️  Total time:  253 seconds
+⏰ Finished at: 2026-02-02 12:48:38
+⏱️  Total time:  6 seconds
 
-✅ Successful: 100
+✅ Successful: 7
 ❌ Failed: 0
 
 ✨ Done!
@@ -172,8 +185,8 @@ The script implements a two-level retry mechanism:
 ## 🚨 Troubleshooting
 
 ### "401 Unauthorized" or "403 Forbidden"
-- **Issue**: Session tokens have expired
-- **Solution**: Re-extract tokens from DevTools (they expire after 15-60 minutes)
+- **Issue**: Session tokens have expired or are invalid
+- **Solution**: Re-extract all tokens from DevTools Network tab (session typically expires after 15-60 minutes)
 
 ### "408 Request Timeout"
 - **Issue**: Server is busy or rate-limited
